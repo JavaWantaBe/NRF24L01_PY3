@@ -5,7 +5,7 @@
 #
 # João Paulo Barraca <jpbarraca@gmail.com>
 #
-from nrf24 import NRF24
+from nrf24l01.nrf24 import NRF24
 import time
 
 pipes = [[0xe7, 0xe7, 0xe7, 0xe7, 0xe7], [0xc2, 0xc2, 0xc2, 0xc2, 0xc2]]
