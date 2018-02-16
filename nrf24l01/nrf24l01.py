@@ -145,7 +145,7 @@ class NRF24L01(Thread):
     crclength_e_str_P = ["Disabled", "", "8 bits", "", "16 bits"]
     pa_dbm_e_str_P = ["PA_MIN", "PA_LOW", "PA_HIGH", "PA_MAX"]
 
-    states = ['power_down', 'start_up', 'standby_i', 'standby_ii', 'tx_setting', 'tx_mode', 'rx_setting', 'rx_mode']
+    states = ['power_down', 'start_up', 'standby_i', 'standby_ii', 'tx_settling', 'tx_mode', 'rx_settling', 'rx_mode']
 
     def __init__(self, major, minor, ce_pin, irq_pin):
         """Intialization
@@ -162,6 +162,24 @@ class NRF24L01(Thread):
         assert type(irq_pin) in int, 'IRQ_PIN needs to be of type int'
 
         self.machine = Machine(model=self, state=NRF24L01.states, initial='power_down')
+        # Power Down -> Startup
+        self.machine.add_transition(trigger='power_on', source='power_down', dest='start_up')
+        # Startup -> Standby I
+        self.machine.add_transition(trigger='startup_delay', source='start_up', dest='standby_i')
+        # Standby I -> Power Down
+        self.machine.add_transition(trigger='power_off', source='standby_i', dest='power_down')
+        # Standby I -> Tx Settling
+        self.machine.add_transition(trigger='tx_mode_fifo_not_empty', source='standby_i', dest='tx_settling')
+        # Tx Settling -> Power Down
+        self.machine.add_transition(trigger='power_off', source='tx_settling', dest='power_down')
+        # Tx Settling -> TX Mode
+        self.machine.add_transition(trigger='tx_mode_fifo_empty', source='tx_setting', dest='tx_mode')
+
+        self.machine.add_transition(trigger='tx_finished', source='tx_mode', dest='standby_i')
+        self.machine.add_transition(trigger='rx_mode_ce_high', source='standby_i', dest='rx_setting')
+        self.machine.add_transition(trigger='rx_setting_delay', source='rx_setting', dest='rx_mode')
+        self.machine.add_transition(trigger='rx_mode_ce_low', source='rx_mode', dest='standby_i')
+
 
         # Locks and Queues
         self.__rx_queue = Queue()
