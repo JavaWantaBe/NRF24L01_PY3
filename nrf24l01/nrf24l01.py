@@ -4,6 +4,7 @@
 
 import spidev
 import RPi.GPIO as GPIO
+from transitions import Machine, MachineError
 
 # Use a monotonic clock if available to avoid unwanted side effects from clock
 # changes
@@ -144,25 +145,7 @@ class NRF24L01(Thread):
     crclength_e_str_P = ["Disabled", "", "8 bits", "", "16 bits"]
     pa_dbm_e_str_P = ["PA_MIN", "PA_LOW", "PA_HIGH", "PA_MAX"]
 
-    @staticmethod
-    def print_single_status_line(name, value):
-        print("{0:<16}= {1}".format(name, value))
-
-    @staticmethod
-    def _to_8b_list(data):
-        """Convert an arbitrary iterable or single int to a list of ints
-            where each int is smaller than 256."""
-        if isinstance(data, str):
-            data = [ord(x) for x in data]
-        elif isinstance(data, int):
-            data = data.to_bytes(2, byteorder='big')
-        else:
-            data = [int(x) for x in data]
-
-        for byte in data:
-            if byte < 0 or byte > 255:
-                raise RuntimeError("Value %d is larger than 8 bits" % byte)
-        return data
+    states = ['power_down', 'start_up', 'standby_i', 'standby_ii', 'tx_setting', 'tx_mode', 'rx_setting', 'rx_mode']
 
     def __init__(self, major, minor, ce_pin, irq_pin):
         """Intialization
@@ -177,6 +160,8 @@ class NRF24L01(Thread):
         assert type(minor) is int, 'Minor needs to be of type int'
         assert type(ce_pin) in int, 'CE_PIN needs to be of type int'
         assert type(irq_pin) in int, 'IRQ_PIN needs to be of type int'
+
+        self.machine = Machine(model=self, state=NRF24L01.states, initial='power_down')
 
         # Locks and Queues
         self.__rx_queue = Queue()
@@ -331,6 +316,26 @@ class NRF24L01(Thread):
 
     def _clear_irq_flags(self):
         self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR | NRF24L01.TX_DS | NRF24L01.MAX_RT)
+
+    @staticmethod
+    def print_single_status_line(name, value):
+        print("{0:<16}= {1}".format(name, value))
+
+    @staticmethod
+    def _to_8b_list(data):
+        """Convert an arbitrary iterable or single int to a list of ints
+            where each int is smaller than 256."""
+        if isinstance(data, str):
+            data = [ord(x) for x in data]
+        elif isinstance(data, int):
+            data = data.to_bytes(2, byteorder='big')
+        else:
+            data = [int(x) for x in data]
+
+        for byte in data:
+            if byte < 0 or byte > 255:
+                raise RuntimeError("Value %d is larger than 8 bits" % byte)
+        return data
 
     @property
     def status(self):
