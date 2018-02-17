@@ -6,6 +6,8 @@ import spidev
 import RPi.GPIO as GPIO
 from transitions import Machine, MachineError
 
+import logging
+
 # Use a monotonic clock if available to avoid unwanted side effects from clock
 # changes
 try:
@@ -14,9 +16,11 @@ except ImportError:
     from time import time as monotonic
 
 import time
-
 from threading import Thread, Lock, Event
 from queue import Queue
+
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger('NRF24L01').setLevel(logging.DEBUG)
 
 
 class NRF24L01(Thread):
@@ -141,11 +145,38 @@ class NRF24L01(Thread):
     RF_PWR_HIGH = 0x04
 
     datarate_e_str_P = ["1MBPS", "2MBPS", "250KBPS"]
-    model_e_str_P = ["NRF24L01L01", "NRF24L01l01+"]
     crclength_e_str_P = ["Disabled", "", "8 bits", "", "16 bits"]
     pa_dbm_e_str_P = ["PA_MIN", "PA_LOW", "PA_HIGH", "PA_MAX"]
 
-    states = ['power_down', 'standby_i', 'standby_ii', 'tx_settling', 'tx_mode', 'rx_settling', 'rx_mode']
+    states = ['power_down', 'start_up', 'standby_i', 'standby_ii', 'tx_settling', 'tx_mode', 'rx_settling', 'rx_mode']
+    transitions = [
+        # Power Down -> Startup
+        {'trigger': 'power_on', 'source': 'power_down', 'dest': 'start_up', 'after': '_startup_delay'},
+        # Startup -> Standby I
+        {'trigger': 'start_settled', 'source': 'start_up', 'dest': 'standby_i', 'prepare': 'print_details'},
+        # Various states -> Power Down
+        {'trigger': 'power_off', 'source': ['rx_settling', 'rx_mode', 'tx_mode', 'tx_settling', 'standby_ii', 'standby_i'], 'dest': 'power_down'},
+        # Various states -> Standby I
+        {'trigger': 'ce_low', 'source': ['rx_mode', 'rx_settling'], 'dest': 'standby_i'},
+        # Standby I -> RX Settling
+        {'trigger': 'ce_high', 'source': 'standby_i', 'dest': 'rx_settling', 'conditions': ['_is_prim_rx'], 'after': '_rx_settle_time'},
+        # RX Settling -> RX Mode
+        {'trigger': 'rx_settled', 'source': 'rx_settling', 'dest': 'rx_mode', 'after': 'process_rx'},
+        # RX_MODE -> Standby I
+        {'trigger': 'ce_low', 'source': 'rx_mode', 'dest': 'standby_i'},
+        # Standby I -> Tx Settling
+        {'trigger': 'ce_high', 'source': 'standby_i', 'dest': 'tx_settling', 'unless': ['_is_prim_rx', '_is_tx_fifo_empty'], 'after': '_tx_settle_time'},
+        # Standby I -> Standby II
+        {'trigger': 'ce_high', 'source': 'standby_i', 'dest': 'standby_ii', 'unless': ['_is_prim_rx'], 'conditions':['_is_tx_fifo_empty']},
+        # Tx Settling -> TX Mode
+        {'trigger': 'tx_settled', 'source': 'tx_settling', 'dest': 'tx_mode', 'after': 'process_tx'},
+        # TX_MODE -> Standby I
+        {'trigger': 'ce_low', 'source': 'tx_mode', 'dest': 'standby_i', 'conditions': ['_is_tx_fifo_empty']},
+        # TX_MODE -> Standby II
+        {'trigger': 'tx_empty', 'source': 'tx_mode', 'dest': 'standby_ii', 'conditions': ['_is_ce', '_is_tx_fifo_empty']},
+        # Standby II -> Tx Settling
+        {'trigger': 'tx_not_empty', 'source': 'standby_ii', 'dest': 'tx_settling', 'conditions': ['_is_ce'], 'after': '_tx_settle_time'}
+    ]
 
     def __init__(self, major, minor, ce_pin, irq_pin):
         """Intialization
@@ -160,68 +191,11 @@ class NRF24L01(Thread):
         assert type(minor) is int, 'Minor needs to be of type int'
         assert type(ce_pin) is int, 'CE_PIN needs to be of type int'
         assert type(irq_pin) is int, 'IRQ_PIN needs to be of type int'
-
+        # State Machine
         self.machine = Machine(model=self,
                                states=self.states,
+                               transitions=self.transitions,
                                initial='power_down')
-        # PowerDown -> Startup -> Standby I
-        self.machine.add_transition(trigger='power_on',
-                                    source='power_down',
-                                    dest='standby_i',
-                                    before='_startup_delay')
-
-        # Various states -> Power Down
-        self.machine.add_transition(trigger='power_off',
-                                    source=['rx_settling', 'rx_mode', 'tx_mode', 'tx_settling', 'standby_ii', 'standby_i'],
-                                    dest='power_down')
-        # Various states -> Standby I
-        self.machine.add_transition(trigger='ce_low',
-                                    source=['rx_mode', 'rx_settling'],
-                                    dest='standby_i')
-        # Standby I -> PRIM_RX 1 -> CE 1 -> RX Settling
-        self.machine.add_transition(trigger='ce_high',
-                                    source='standby_i',
-                                    dest='rx_settling',
-                                    conditions='_prim_rx',
-                                    after='_rx_settle_time')
-        # RX Settling -> RX Mode
-        self.machine.add_transition(trigger='rx_settled',
-                                    source='rx_settling',
-                                    dest='rx_mode',
-                                    after='rx_process')
-        # RX_MODE -> Standby I
-        self.machine.add_transition(trigger='ce_low',
-                                    source='rx_mode',
-                                    dest='standby_i')
-        # Standby I -> Tx Settling
-        self.machine.add_transition(trigger='ce_high',
-                                    source='standby_i',
-                                    dest='tx_setting',
-                                    unless=['_prim_rx', '_tx_fifo_empty'],
-                                    after='_tx_settle_time')
-        # Tx Settling -> TX Mode
-        self.machine.add_transition(trigger='tx_settled',
-                                    source='tx_settling',
-                                    dest='tx_mode',
-                                    after='process_tx')
-
-        # TX_MODE -> Standby I
-        self.machine.add_transition(trigger='ce_low',
-                                    source='tx_mode',
-                                    dest='standby_i',
-                                    conditions='_tx_fifo_empty')
-
-        # TX_MODE -> Standby II
-        self.machine.add_transition(trigger='tx_empty',
-                                    source='tx_mode',
-                                    dest='standby_ii',
-                                    conditions=['ce', '_tx_fifo_empty'])
-        # Standby II -> Tx Settling
-        self.machine.add_transition(trigger='tx_not_empty',
-                                    source='standby_ii',
-                                    dest='tx_settling',
-                                    conditions='ce',
-                                    after='_tx_settle_time')
 
         # Locks and Queues
         self.__rx_queue = Queue()
@@ -237,7 +211,7 @@ class NRF24L01(Thread):
         self.__spidev.bits_per_word = 8
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(True)
-        GPIO.setup(self.__ce_pin, GPIO.OUT)
+        GPIO.setup(self.__ce_pin, GPIO.OUT, initial=GPIO.LOW)
         GPIO.setup(self.__irq_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.add_event_detect(self.__irq_pin, GPIO.FALLING, callback=self._handle_irq)
         try:
@@ -251,14 +225,7 @@ class NRF24L01(Thread):
         self.__spidev.lsbfirst = False
         self.__spidev.threewire = False
 
-        self.power_up()
-
         self.__pipe0_reading_address = None  # *< Last address set on pipe 0 for reading.
-        # self.__payload_size = None
-        #
-        # self.ack_payload_available = False      # *< Whether there is an ack payload waiting
-        # self.dynamic_payloads_enabled = False   # *< Whether dynamic payloads are enabled.
-        # self.ack_payload_length = 5             # *< Dynamic size of pending ack payload.
 
         # Reset radio configuration
         self.reset()
@@ -267,6 +234,7 @@ class NRF24L01(Thread):
         self._flush_rx()
         self._flush_tx()
         self._clear_irq_flags()
+        self.power_up()
 
     def _handle_irq(self, gpio):
         pass
@@ -296,7 +264,7 @@ class NRF24L01(Thread):
         """
         buf = [NRF24L01.W_REGISTER | (NRF24L01.REGISTER_MASK & reg)]
         buf += self._to_8b_list(value)
-        self.__spidev.xfer2(buf)
+        return self.__spidev.xfer2(buf)
 
     def _ce(self, level, pulse=0):
         """CE pin used for transmission of packets or continual transmission mode
@@ -305,14 +273,13 @@ class NRF24L01(Thread):
         :param pulse:
         :return:
         """
-        if self.__ce_pin is not None:
-            GPIO.output(self.__ce_pin, level)
-            # Trigger state machine
-            self.ce_high() if level else self.ce_low()
+        GPIO.output(self.__ce_pin, level)
+        # Trigger state machine
+        self.ce_high() if level == GPIO.HIGH else self.ce_low()
 
-            if pulse > 0:
-                time.sleep(pulse)
-                GPIO.output(self.__ce_pin, not level)
+        if pulse > 0:
+            time.sleep(pulse)
+            GPIO.output(self.__ce_pin, not level)
 
     def _flush_rx(self):
         """Flush RX FIFO, used in RX mode Should not be executed during transmission of
@@ -320,14 +287,14 @@ class NRF24L01(Thread):
 
         :return:
         """
-        return self.__spidev.xfer2([NRF24L01.FLUSH_RX])[0]
+        self._write_reg(NRF24L01.FLUSH_RX, 0)
 
     def _flush_tx(self):
         """Flush TX FIFO, used in TX mode
 
         :return:
         """
-        return self.__spidev.xfer2([NRF24L01.FLUSH_TX])[0]
+        self._write_reg(NRF24L01.FLUSH_TX, 0)
 
     def _rx_settle_time(self):
         time.sleep(130e-9)
@@ -339,6 +306,7 @@ class NRF24L01(Thread):
 
     def _startup_delay(self):
         time.sleep(150e-6)
+        self.start_settled()
 
     def _toggle_features(self):
         self._write_reg(NRF24L01.ACTIVATE, 0x73)
@@ -366,17 +334,18 @@ class NRF24L01(Thread):
                 raise RuntimeError("Value %d is larger than 8 bits" % byte)
         return data
 
-    @property
-    def _prim_rx(self):
+    def _is_prim_rx(self):
         return True if self._read_reg(NRF24L01.CONFIG) & 0x01 else False
 
-    @property
-    def _tx_fifo_empty(self):
+    def _is_tx_fifo_empty(self):
         return True if self._read_reg(NRF24L01.FIFO_STATUS) & 0x10 else False
+
+    def _is_ce(self):
+        return True if GPIO.input(self.__ce_pin) == GPIO.HIGH else False
 
     @property
     def status(self):
-        return self.__spidev.xfer2([NRF24L01.NOP])[0]
+        return self._read_reg(NRF24L01.NOP, 1)
 
     # Config registers
     def enable_interrupt(self, interrupt):
@@ -386,12 +355,11 @@ class NRF24L01(Thread):
         :return:
         """
         config = self._read_reg(NRF24L01.CONFIG)
-        # NRF24L01.RX_DR | NRF24L01.TX_DS | NRF24L01.MAX_RT
-        if interrupt == NRF24L01.RX_DR:
+        if interrupt & NRF24L01.RX_DR:
             config |= NRF24L01.RX_DR
-        elif interrupt == NRF24L01.TX_DS:
+        if interrupt & NRF24L01.TX_DS:
             config |= NRF24L01.TX_DS
-        elif interrupt == NRF24L01.MAX_RT:
+        if interrupt & NRF24L01.MAX_RT:
             config |= NRF24L01.MAX_RT
 
         self._write_reg(NRF24L01.CONFIG, config)
@@ -403,11 +371,11 @@ class NRF24L01(Thread):
         :return:
         """
         config = self._read_reg(NRF24L01.CONFIG)
-        if interrupt == NRF24L01.RX_DR:
+        if interrupt & NRF24L01.RX_DR:
             config &= ~NRF24L01.RX_DR
-        elif interrupt == NRF24L01.TX_DS:
+        if interrupt & NRF24L01.TX_DS:
             config &= ~NRF24L01.TX_DS
-        elif interrupt == NRF24L01.MAX_RT:
+        if interrupt & NRF24L01.MAX_RT:
             config &= ~NRF24L01.MAX_RT
 
         self._write_reg(NRF24L01.CONFIG, config)
@@ -483,13 +451,13 @@ class NRF24L01(Thread):
 
         :return:
         """
-        self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP | NRF24L01.PRIM_RX)
+        self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) | (NRF24L01.PWR_UP | NRF24L01.PRIM_RX))
 
         # Restore the pipe0 address, if exists
         if self.__pipe0_reading_address:
             self._write_reg(self.RX_ADDR_P0, self.__pipe0_reading_address)
 
-        # Go!
+        # Put in PRIM_RX mode
         self._ce(GPIO.HIGH)
 
     def stop_listening(self):
@@ -497,10 +465,9 @@ class NRF24L01(Thread):
 
         :return:
         """
-        self._ce(GPIO.LOW)
-
         # Enable TX
         self._write_reg(NRF24L01.CONFIG, (self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP) & ~NRF24L01.PRIM_RX)
+        self._ce(GPIO.HIGH)
 
         # Enable pipe 0 for auto-ack
         self._write_reg(NRF24L01.EN_RXADDR, self._read_reg(NRF24L01.EN_RXADDR) | 1)
@@ -564,7 +531,7 @@ class NRF24L01(Thread):
 
         self._write_reg(NRF24L01.RX_ADDR_P0, value)
         self._write_reg(NRF24L01.TX_ADDR, value)
-        if not self.dynamic_payloads_enabled:
+        if not self.is_dynamic_payload(0):
             self._write_reg(NRF24L01.RX_PW_P0, payload)
 
     @property
@@ -596,9 +563,8 @@ class NRF24L01(Thread):
     @retries.setter
     def retries(self, delay, count):
         self._write_reg(NRF24L01.SETUP_RETR, (delay & 0xf) << NRF24L01.ARD | (count & 0xf) << NRF24L01.ARC)
-        self.delay = delay * 0.000250
-        self.retries = count
-        self.max_timeout = (self.payload_size / float(self.data_rate_bits) + self.delay) * self.retries
+        delay *= 0.000250
+        max_timeout = (self.payload_size / float(self.data_rate_bits) + self.delay) * self.retries
         self.timeout = (self.payload_size / float(self.data_rate_bits) + self.delay)
 
     @property
@@ -955,6 +921,7 @@ class NRF24L01(Thread):
     def stop(self):
         self.__running = False
         GPIO.cleanup(self.__ce_pin)
+        GPIO.remove_event_detect(self.__irq_pin)
         GPIO.cleanup(self.__irq_pin)
         if self.__spidev:
             self.__spidev.close()
@@ -972,7 +939,7 @@ class NRF24L01(Thread):
 
 
     def process_tx(self):
-        while not self._tx_fifo_empty:
+        while not self._is_tx_fifo_empty():
             # TODO Transmit
             pass
 
@@ -1014,7 +981,6 @@ class NRF24L01(Thread):
         self.print_address_register("RX_ADDR_P0-1", NRF24L01.RX_ADDR_P0, 2)
         self.print_byte_register("RX_ADDR_P2-5", NRF24L01.RX_ADDR_P2, 4)
         self.print_address_register("TX_ADDR", NRF24L01.TX_ADDR)
-
         self.print_byte_register("RX_PW_P0-6", NRF24L01.RX_PW_P0, 6)
         self.print_byte_register("EN_AA", NRF24L01.EN_AA)
         self.print_byte_register("EN_RXADDR", NRF24L01.EN_RXADDR)
@@ -1026,9 +992,7 @@ class NRF24L01(Thread):
         self.print_byte_register("FIFO_STATUS", NRF24L01.FIFO_STATUS)
         self.print_byte_register("DYNPD", NRF24L01.DYNPD)
         self.print_byte_register("FEATURE", NRF24L01.FEATURE)
-
-        self.print_single_status_line("Data Rate", NRF24L01.datarate_e_str_P[self.getDataRate()])
-        self.print_single_status_line("Model", NRF24L01.model_e_str_P[self.isPVariant()])
-        self.print_single_status_line("CRC Length", NRF24L01.crclength_e_str_P[self.getCRCLength()])
-        self.print_single_status_line("PA Power", NRF24L01.pa_dbm_e_str_P[self.getPALevel()])
+        self.print_single_status_line("Data Rate", NRF24L01.datarate_e_str_P[self.data_rate])
+        self.print_single_status_line("CRC Length", NRF24L01.crclength_e_str_P[self.crc_length])
+        self.print_single_status_line("PA Power", NRF24L01.pa_dbm_e_str_P[self.pa_level])
 
