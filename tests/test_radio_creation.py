@@ -7,9 +7,13 @@ class TestDeviceCreation(unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        radio = NRF24L01(0, 1, 12, 17)
-        if radio is None:
-            print('bad')
+        self.radio = NRF24L01(0, 1, 12, 17)
+
+    def testValid(self):
+        if self.radio is not None:
+            print('happy')
+        else:
+            print('sad')
 
 
 

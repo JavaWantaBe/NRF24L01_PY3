@@ -158,8 +158,8 @@ class NRF24L01(Thread):
         super(NRF24L01, self).__init__(daemon=True, name='NRF24L01+')
         assert type(major) is int, 'Major needs to be of type int'
         assert type(minor) is int, 'Minor needs to be of type int'
-        assert type(ce_pin) in int, 'CE_PIN needs to be of type int'
-        assert type(irq_pin) in int, 'IRQ_PIN needs to be of type int'
+        assert type(ce_pin) is int, 'CE_PIN needs to be of type int'
+        assert type(irq_pin) is int, 'IRQ_PIN needs to be of type int'
 
         self.machine = Machine(model=self,
                                states=self.states,
@@ -243,7 +243,7 @@ class NRF24L01(Thread):
         try:
             self.__spidev.max_speed_hz = 10000000  # Maximum supported by NRF24L01L01+
         except IOError:
-            pass  # Hardware does not support this speed
+            self.__spidev.max_speed_hz = 2000000   # Hardware does not support 10MHz
 
         self.__spidev.cshigh = False # Might need to be pulled low
         self.__spidev.mode = 0
@@ -251,12 +251,14 @@ class NRF24L01(Thread):
         self.__spidev.lsbfirst = False
         self.__spidev.threewire = False
 
-        self.__pipe0_reading_address = None  # *< Last address set on pipe 0 for reading.
-        self.__payload_size = None
+        self.power_up()
 
-        self.ack_payload_available = False      # *< Whether there is an ack payload waiting
-        self.dynamic_payloads_enabled = False   # *< Whether dynamic payloads are enabled.
-        self.ack_payload_length = 5             # *< Dynamic size of pending ack payload.
+        self.__pipe0_reading_address = None  # *< Last address set on pipe 0 for reading.
+        # self.__payload_size = None
+        #
+        # self.ack_payload_available = False      # *< Whether there is an ack payload waiting
+        # self.dynamic_payloads_enabled = False   # *< Whether dynamic payloads are enabled.
+        # self.ack_payload_length = 5             # *< Dynamic size of pending ack payload.
 
         # Reset radio configuration
         self.reset()
@@ -365,10 +367,6 @@ class NRF24L01(Thread):
         return data
 
     @property
-    def _ce(self):
-        return GPIO.input(self.__ce_pin)
-
-    @property
     def _prim_rx(self):
         return True if self._read_reg(NRF24L01.CONFIG) & 0x01 else False
 
@@ -470,7 +468,7 @@ class NRF24L01(Thread):
         :return:
         """
         self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) & ~NRF24L01.PWR_UP)
-        self.power_on()
+        self.power_off()
 
     def power_up(self):
         """Power up radio
@@ -478,7 +476,7 @@ class NRF24L01(Thread):
         :return:
         """
         self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP)
-        self.power_off()
+        self.power_on()
 
     def start_listening(self):
         """Set Primary RX
@@ -655,16 +653,11 @@ class NRF24L01(Thread):
         if speed == NRF24L01.BR_250KBPS:
             # Must set the RF_DR_LOW to 1 RF_DR_HIGH (used to be RF_DR) is already 0
             # Making it '10'.
-            self.data_rate_bits = 250
             setup |= NRF24L01.RF_DR_LOW
         elif speed == NRF24L01.BR_2MBPS:
             # Set 2Mbs, RF_DR (RF_DR_HIGH) is set 1
             # Making it '01'
-            self.data_rate_bits = 2000
             setup |= NRF24L01.RF_DR_HIGH
-        else:
-            # 1Mbs
-            self.data_rate_bits = 1000
 
         self._write_reg(NRF24L01.RF_SETUP, setup)
 
@@ -737,6 +730,7 @@ class NRF24L01(Thread):
 
     @property
     def payload_size(self):
+        # TODO Get from pipe
         return self.__payload_size
 
     @payload_size.setter
@@ -943,7 +937,6 @@ class NRF24L01(Thread):
         """ Make sure the NRF is in the same state as after power up
             to avoid problems resulting from left over configuration
             from other programs."""
-        self._ce(GPIO.LOW)
         reset_values = {0: 0x08, 1: 0x3F, 2: 0x02, 3: 0x03, 4: 0x03, 5: 0x02, 6: 0x06,
                         0x0a: [0xe7, 0xe7, 0xe7, 0xe7, 0xe7],
                         0x0b: [0xc2, 0xc2, 0xc2, 0xc2, 0xc2],
@@ -954,9 +947,6 @@ class NRF24L01(Thread):
         for reg, value in reset_values.items():
             self._write_reg(reg, value)
 
-        self._flush_rx()
-        self._flush_tx()
-
     def start(self):
         self.__running = True
         while self.__running:
@@ -964,6 +954,8 @@ class NRF24L01(Thread):
 
     def stop(self):
         self.__running = False
+        GPIO.cleanup(self.__ce_pin)
+        GPIO.cleanup(self.__irq_pin)
         if self.__spidev:
             self.__spidev.close()
             self.__spidev = None
