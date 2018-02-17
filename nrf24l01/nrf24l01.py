@@ -145,7 +145,7 @@ class NRF24L01(Thread):
     crclength_e_str_P = ["Disabled", "", "8 bits", "", "16 bits"]
     pa_dbm_e_str_P = ["PA_MIN", "PA_LOW", "PA_HIGH", "PA_MAX"]
 
-    states = ['power_down', 'start_up', 'standby_i', 'standby_ii', 'tx_settling', 'tx_mode', 'rx_settling', 'rx_mode']
+    states = ['power_down', 'standby_i', 'standby_ii', 'tx_settling', 'tx_mode', 'rx_settling', 'rx_mode']
 
     def __init__(self, major, minor, ce_pin, irq_pin):
         """Intialization
@@ -161,25 +161,67 @@ class NRF24L01(Thread):
         assert type(ce_pin) in int, 'CE_PIN needs to be of type int'
         assert type(irq_pin) in int, 'IRQ_PIN needs to be of type int'
 
-        self.machine = Machine(model=self, state=NRF24L01.states, initial='power_down')
-        # Power Down -> Startup
-        self.machine.add_transition(trigger='power_on', source='power_down', dest='start_up')
-        # Startup -> Standby I
-        self.machine.add_transition(trigger='startup_delay', source='start_up', dest='standby_i')
-        # Standby I -> Power Down
-        self.machine.add_transition(trigger='power_off', source='standby_i', dest='power_down')
+        self.machine = Machine(model=self,
+                               states=self.states,
+                               initial='power_down')
+        # PowerDown -> Startup -> Standby I
+        self.machine.add_transition(trigger='power_on',
+                                    source='power_down',
+                                    dest='standby_i',
+                                    before='_startup_delay')
+
+        # Various states -> Power Down
+        self.machine.add_transition(trigger='power_off',
+                                    source=['rx_settling', 'rx_mode', 'tx_mode', 'tx_settling', 'standby_ii', 'standby_i'],
+                                    dest='power_down')
+        # Various states -> Standby I
+        self.machine.add_transition(trigger='ce_low',
+                                    source=['rx_mode', 'rx_settling'],
+                                    dest='standby_i')
+        # Standby I -> PRIM_RX 1 -> CE 1 -> RX Settling
+        self.machine.add_transition(trigger='ce_high',
+                                    source='standby_i',
+                                    dest='rx_settling',
+                                    conditions='_prim_rx',
+                                    after='_rx_settle_time')
+        # RX Settling -> RX Mode
+        self.machine.add_transition(trigger='rx_settled',
+                                    source='rx_settling',
+                                    dest='rx_mode',
+                                    after='rx_process')
+        # RX_MODE -> Standby I
+        self.machine.add_transition(trigger='ce_low',
+                                    source='rx_mode',
+                                    dest='standby_i')
         # Standby I -> Tx Settling
-        self.machine.add_transition(trigger='tx_mode_fifo_not_empty', source='standby_i', dest='tx_settling')
-        # Tx Settling -> Power Down
-        self.machine.add_transition(trigger='power_off', source='tx_settling', dest='power_down')
+        self.machine.add_transition(trigger='ce_high',
+                                    source='standby_i',
+                                    dest='tx_setting',
+                                    unless=['_prim_rx', '_tx_fifo_empty'],
+                                    after='_tx_settle_time')
         # Tx Settling -> TX Mode
-        self.machine.add_transition(trigger='tx_mode_fifo_empty', source='tx_setting', dest='tx_mode')
+        self.machine.add_transition(trigger='tx_settled',
+                                    source='tx_settling',
+                                    dest='tx_mode',
+                                    after='process_tx')
 
-        self.machine.add_transition(trigger='tx_finished', source='tx_mode', dest='standby_i')
-        self.machine.add_transition(trigger='rx_mode_ce_high', source='standby_i', dest='rx_setting')
-        self.machine.add_transition(trigger='rx_setting_delay', source='rx_setting', dest='rx_mode')
-        self.machine.add_transition(trigger='rx_mode_ce_low', source='rx_mode', dest='standby_i')
+        # TX_MODE -> Standby I
+        self.machine.add_transition(trigger='ce_low',
+                                    source='tx_mode',
+                                    dest='standby_i',
+                                    conditions='_tx_fifo_empty')
 
+        # TX_MODE -> Standby II
+        self.machine.add_transition(trigger='tx_empty',
+                                    source='tx_mode',
+                                    dest='standby_ii',
+                                    conditions=['ce', '_tx_fifo_empty'])
+        # Standby II -> Tx Settling
+        self.machine.add_transition(trigger='tx_not_empty',
+                                    source='standby_ii',
+                                    dest='tx_settling',
+                                    conditions='ce',
+                                    after='_tx_settle_time')
 
         # Locks and Queues
         self.__rx_queue = Queue()
@@ -209,61 +251,15 @@ class NRF24L01(Thread):
         self.__spidev.lsbfirst = False
         self.__spidev.threewire = False
 
-        time.sleep(5 / 1000000.0)
-        # Hardware Finished
-
         self.__pipe0_reading_address = None  # *< Last address set on pipe 0 for reading.
         self.__payload_size = None
-
-
-
-
-
-
 
         self.ack_payload_available = False      # *< Whether there is an ack payload waiting
         self.dynamic_payloads_enabled = False   # *< Whether dynamic payloads are enabled.
         self.ack_payload_length = 5             # *< Dynamic size of pending ack payload.
 
-        self.last_error = 0
-
-        self.auto_ack = 0x3F
-
-        self.p_variant = False  # False for RF24L01 and true for RF24L01P
         # Reset radio configuration
         self.reset()
-
-        # Set 1500uS (minimum for 32B payload in ESB@250KBPS) timeouts, to make testing a little easier
-        # WARNING: If this is ever lowered, either 250KBS mode with AA is broken or maximum packet
-        # sizes must never be used. See documentation for a more complete explanation.
-        self.setRetries(int('0101', 2), 15)
-
-        # Restore our default PA level
-        self.setPALevel(NRF24L01.PA_MAX)
-
-        # Determine if this is a p or non-p RF24 module and then
-        # reset our data rate back to default value. This works
-        # because a non-P variant won't allow the data rate to
-        # be set to 250Kbps.
-        if self.setDataRate(NRF24L01.BR_250KBPS):
-            self.p_variant = True
-
-        # Then set the data rate to the slowest (and most reliable) speed supported by all
-        # hardware.
-        self.setDataRate(NRF24L01.BR_1MBPS)
-
-        # Initialize CRC and request 2-byte (16bit) CRC
-        self.setCRCLength(NRF24L01.CRC_16)
-
-        # Disable dynamic payloads, to match dynamic_payloads_enabled setting
-        self._write_reg(NRF24L01.DYNPD, 0)
-
-        # Set up default configuration.  Callers can always change it later.
-        # This channel should be universally safe and not bleed over into adjacent
-        # spectrum.
-        self.channel = 76
-
-        self.setRetries(15, 15)
 
         # Flush buffers
         self._flush_rx()
@@ -293,7 +289,7 @@ class NRF24L01(Thread):
         """Write LL Register Value
 
         :param int reg:
-        :param int value:
+        :param [int, list] value:
         :return:
         """
         buf = [NRF24L01.W_REGISTER | (NRF24L01.REGISTER_MASK & reg)]
@@ -309,9 +305,12 @@ class NRF24L01(Thread):
         """
         if self.__ce_pin is not None:
             GPIO.output(self.__ce_pin, level)
+            # Trigger state machine
+            self.ce_high() if level else self.ce_low()
+
             if pulse > 0:
                 time.sleep(pulse)
-                GPIO.output(self.__ce_pin, ~level)
+                GPIO.output(self.__ce_pin, not level)
 
     def _flush_rx(self):
         """Flush RX FIFO, used in RX mode Should not be executed during transmission of
@@ -328,9 +327,19 @@ class NRF24L01(Thread):
         """
         return self.__spidev.xfer2([NRF24L01.FLUSH_TX])[0]
 
+    def _rx_settle_time(self):
+        time.sleep(130e-9)
+        self.rx_settled()
+
+    def _tx_settle_time(self):
+        time.sleep(130e-9)
+        self.tx_settled()
+
+    def _startup_delay(self):
+        time.sleep(150e-6)
+
     def _toggle_features(self):
-        buf = [NRF24L01.ACTIVATE, 0x73]
-        self.__spidev.xfer2(buf)
+        self._write_reg(NRF24L01.ACTIVATE, 0x73)
 
     def _clear_irq_flags(self):
         self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR | NRF24L01.TX_DS | NRF24L01.MAX_RT)
@@ -356,6 +365,18 @@ class NRF24L01(Thread):
         return data
 
     @property
+    def _ce(self):
+        return GPIO.input(self.__ce_pin)
+
+    @property
+    def _prim_rx(self):
+        return True if self._read_reg(NRF24L01.CONFIG) & 0x01 else False
+
+    @property
+    def _tx_fifo_empty(self):
+        return True if self._read_reg(NRF24L01.FIFO_STATUS) & 0x10 else False
+
+    @property
     def status(self):
         return self.__spidev.xfer2([NRF24L01.NOP])[0]
 
@@ -363,7 +384,7 @@ class NRF24L01(Thread):
     def enable_interrupt(self, interrupt):
         """Enable interrupt
 
-        :param interrupt:
+        :param int interrupt:
         :return:
         """
         config = self._read_reg(NRF24L01.CONFIG)
@@ -380,7 +401,7 @@ class NRF24L01(Thread):
     def disable_interrupt(self, interrupt):
         """Disable interrupt
 
-        :param interrupt:
+        :param int interrupt:
         :return:
         """
         config = self._read_reg(NRF24L01.CONFIG)
@@ -449,6 +470,7 @@ class NRF24L01(Thread):
         :return:
         """
         self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) & ~NRF24L01.PWR_UP)
+        self.power_on()
 
     def power_up(self):
         """Power up radio
@@ -456,7 +478,7 @@ class NRF24L01(Thread):
         :return:
         """
         self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP)
-        time.sleep(150e-6)
+        self.power_off()
 
     def start_listening(self):
         """Set Primary RX
@@ -510,7 +532,8 @@ class NRF24L01(Thread):
         """Open RX pipe
 
         :param int pipe:
-        :param bytes address:
+        :param list address:
+        :param int payload:
         :return:
         """
         if pipe >= 6:
@@ -527,7 +550,7 @@ class NRF24L01(Thread):
         self._write_reg(NRF24L01.RX_ADDR_P0 + pipe, address)
         self._write_reg(NRF24L01.EN_RXADDR, self._read_reg(NRF24L01.EN_RXADDR) | (1 << pipe))
         if not self.is_dynamic_payload(pipe):
-            self._write_reg(NRF24L01.RX_PW_P0 + pipe, self.payload_size)
+            self._write_reg(NRF24L01.RX_PW_P0 + pipe, payload)
 
     def close_reading_pipe(self, pipe):
         """Closes RX Pipe
@@ -537,14 +560,14 @@ class NRF24L01(Thread):
         """
         self._write_reg(NRF24L01.EN_RXADDR, self._read_reg(NRF24L01.EN_RXADDR) & ~(1 << pipe))
 
-    def open_writing_pipe(self, value):
+    def open_writing_pipe(self, value, payload):
         # Note that the NRF24L01L01(+)
         # expects it LSB first.
 
         self._write_reg(NRF24L01.RX_ADDR_P0, value)
         self._write_reg(NRF24L01.TX_ADDR, value)
         if not self.dynamic_payloads_enabled:
-            self._write_reg(NRF24L01.RX_PW_P0, self.payload_size)
+            self._write_reg(NRF24L01.RX_PW_P0, payload)
 
     @property
     def address_width(self):
@@ -695,7 +718,7 @@ class NRF24L01(Thread):
         return (self._read_reg(NRF24L01.OBSERVE_TX) & 0xF0) >> 4
 
     @property
-    def retrainsmit_count(self):
+    def retransmit_count(self):
         """Count retransmitted packets. The counter is reset when transmission of a new
         packet starts.
 
@@ -752,61 +775,14 @@ class NRF24L01(Thread):
         # Enable dynamic payload on pipes 0 & 1
         self._write_reg(NRF24L01.DYNPD, self._read_reg(NRF24L01.DYNPD) | NRF24L01.DPL_P1 | NRF24L01.DPL_P0)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     def write_payload(self, buf):
-        """ Writes data to the payload register, automatically padding it
-            to match the required length. Returns the number of bytes
-            actually written. """
+        """Writes data to the payload register, automatically padding it
+        to match the required length. Returns the number of bytes
+        actually written.
+
+        :param buf:
+        :return:
+        """
 
         buf = self._to_8b_list(buf)
         if self.dynamic_payloads_enabled:
@@ -825,8 +801,13 @@ class NRF24L01(Thread):
         return len(txbuffer) - 1
 
     def read_payload(self, buf, buf_len=-1):
-        """ Reads data from the payload register and sets the
-            DR bit of the STATUS register. """
+        """Reads data from the payload register and sets the
+        DR bit of the STATUS register.
+
+        :param buf:
+        :param int buf_len:
+        :return:
+        """
 
         if buf_len < 0:
             buf_len = self.payload_size
@@ -847,58 +828,6 @@ class NRF24L01(Thread):
         self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR)
 
         return data_len
-
-    def print_status(self, status):
-        status_str = "0x{0:02x} RX_DR={1:x} TX_DS={2:x} MAX_RT={3:x} RX_P_NO={4:x} TX_FULL={5:x}".format(
-            status,
-            1 if status & NRF24L01.RX_DR else 0,
-            1 if status & NRF24L01.TX_DS else 0,
-            1 if status & NRF24L01.MAX_RT else 0,
-            ((status >> NRF24L01.RX_P_NO) & int("111", 2)),
-            1 if status & NRF24L01.TX_FULL else 0)
-
-        self.print_single_status_line("STATUS", status_str)
-
-    def print_observe_tx(self, value):
-        tx_str = "OBSERVE_TX=0x{0:02x}: POLS_CNT={2:x} ARC_CNT={2:x}\r\n".format(
-            value,
-            (value >> NRF24L01.PLOS_CNT) & int("1111", 2),
-            (value >> NRF24L01.ARC_CNT) & int("1111", 2))
-        self.print_single_status_line("OBSERVE_TX", tx_str)
-
-    def print_byte_register(self, name, reg, qty=1):
-        registers = ["0x{:0>2x}".format(self._read_reg(reg+r)) for r in range(0, qty)]
-        self.print_single_status_line(name, " ".join(registers))
-
-    def print_address_register(self, name, reg, qty=1):
-        address_registers = ["0x{0:>02x}{1:>02x}{2:>02x}{3:>02x}{4:>02x}".format(
-            *self._read_reg(reg+r, 5))
-            for r in range(qty)]
-
-        self.print_single_status_line(name, " ".join(address_registers))
-
-    def print_details(self):
-        self.print_status(self.status)
-        self.print_address_register("RX_ADDR_P0-1", NRF24L01.RX_ADDR_P0, 2)
-        self.print_byte_register("RX_ADDR_P2-5", NRF24L01.RX_ADDR_P2, 4)
-        self.print_address_register("TX_ADDR", NRF24L01.TX_ADDR)
-
-        self.print_byte_register("RX_PW_P0-6", NRF24L01.RX_PW_P0, 6)
-        self.print_byte_register("EN_AA", NRF24L01.EN_AA)
-        self.print_byte_register("EN_RXADDR", NRF24L01.EN_RXADDR)
-        self.print_byte_register("RF_CH", NRF24L01.RF_CH)
-        self.print_byte_register("RF_SETUP", NRF24L01.RF_SETUP)
-        self.print_byte_register("SETUP_AW", NRF24L01.SETUP_AW)
-        self.print_byte_register("OBSERVE_TX", NRF24L01.OBSERVE_TX)
-        self.print_byte_register("CONFIG", NRF24L01.CONFIG)
-        self.print_byte_register("FIFO_STATUS", NRF24L01.FIFO_STATUS)
-        self.print_byte_register("DYNPD", NRF24L01.DYNPD)
-        self.print_byte_register("FEATURE", NRF24L01.FEATURE)
-
-        self.print_single_status_line("Data Rate", NRF24L01.datarate_e_str_P[self.getDataRate()])
-        self.print_single_status_line("Model", NRF24L01.model_e_str_P[self.isPVariant()])
-        self.print_single_status_line("CRC Length", NRF24L01.crclength_e_str_P[self.getCRCLength()])
-        self.print_single_status_line("PA Power", NRF24L01.pa_dbm_e_str_P[self.getPALevel()])
 
     def write(self, buf):
         self.last_error = None
@@ -935,9 +864,6 @@ class NRF24L01(Thread):
                 break
 
         self._ce(GPIO.LOW)
-        if self.last_error is None:
-            self.last_error = 'TIMEOUT'
-
         self._flush_tx()  # Avoid leaving the payload in tx fifo ! What
         return False
 
@@ -993,20 +919,6 @@ class NRF24L01(Thread):
         # was this the last of the data available?
         return self._read_reg(NRF24L01.FIFO_STATUS & NRF24L01.RX_EMPTY)
 
-    def what_happened(self):
-        # Read the status & reset the status in one easy call
-        # Or is that such a good idea?
-        self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR | NRF24L01.TX_DS | NRF24L01.MAX_RT)
-
-        status = self.status
-        self._clear_irq_flags()
-
-        # Report to the user what happened
-        tx_ok = status & NRF24L01.TX_DS
-        tx_fail = status & NRF24L01.MAX_RT
-        rx_ready = status & NRF24L01.RX_DR
-        return {'tx_ok': tx_ok, "tx_fail": tx_fail, "rx_ready": rx_ready}
-
     def write_ack_payload(self, pipe, buf, buf_len):
         txbuffer = [NRF24L01.W_ACK_PAYLOAD | (pipe & 0x7)]
 
@@ -1055,3 +967,76 @@ class NRF24L01(Thread):
         if self.__spidev:
             self.__spidev.close()
             self.__spidev = None
+
+
+
+
+
+
+
+
+
+
+
+
+    def process_tx(self):
+        while not self._tx_fifo_empty:
+            # TODO Transmit
+            pass
+
+    def process_rx(self):
+        pass
+
+
+    def print_status(self, status):
+        status_str = "0x{0:02x} RX_DR={1:x} TX_DS={2:x} MAX_RT={3:x} RX_P_NO={4:x} TX_FULL={5:x}".format(
+            status,
+            1 if status & NRF24L01.RX_DR else 0,
+            1 if status & NRF24L01.TX_DS else 0,
+            1 if status & NRF24L01.MAX_RT else 0,
+            ((status >> NRF24L01.RX_P_NO) & int("111", 2)),
+            1 if status & NRF24L01.TX_FULL else 0)
+
+        self.print_single_status_line("STATUS", status_str)
+
+    def print_observe_tx(self, value):
+        tx_str = "OBSERVE_TX=0x{0:02x}: POLS_CNT={2:x} ARC_CNT={2:x}\r\n".format(
+            value,
+            (value >> NRF24L01.PLOS_CNT) & int("1111", 2),
+            (value >> NRF24L01.ARC_CNT) & int("1111", 2))
+        self.print_single_status_line("OBSERVE_TX", tx_str)
+
+    def print_byte_register(self, name, reg, qty=1):
+        registers = ["0x{:0>2x}".format(self._read_reg(reg+r)) for r in range(0, qty)]
+        self.print_single_status_line(name, " ".join(registers))
+
+    def print_address_register(self, name, reg, qty=1):
+        address_registers = ["0x{0:>02x}{1:>02x}{2:>02x}{3:>02x}{4:>02x}".format(
+            *self._read_reg(reg+r, 5))
+            for r in range(qty)]
+
+        self.print_single_status_line(name, " ".join(address_registers))
+
+    def print_details(self):
+        self.print_status(self.status)
+        self.print_address_register("RX_ADDR_P0-1", NRF24L01.RX_ADDR_P0, 2)
+        self.print_byte_register("RX_ADDR_P2-5", NRF24L01.RX_ADDR_P2, 4)
+        self.print_address_register("TX_ADDR", NRF24L01.TX_ADDR)
+
+        self.print_byte_register("RX_PW_P0-6", NRF24L01.RX_PW_P0, 6)
+        self.print_byte_register("EN_AA", NRF24L01.EN_AA)
+        self.print_byte_register("EN_RXADDR", NRF24L01.EN_RXADDR)
+        self.print_byte_register("RF_CH", NRF24L01.RF_CH)
+        self.print_byte_register("RF_SETUP", NRF24L01.RF_SETUP)
+        self.print_byte_register("SETUP_AW", NRF24L01.SETUP_AW)
+        self.print_byte_register("OBSERVE_TX", NRF24L01.OBSERVE_TX)
+        self.print_byte_register("CONFIG", NRF24L01.CONFIG)
+        self.print_byte_register("FIFO_STATUS", NRF24L01.FIFO_STATUS)
+        self.print_byte_register("DYNPD", NRF24L01.DYNPD)
+        self.print_byte_register("FEATURE", NRF24L01.FEATURE)
+
+        self.print_single_status_line("Data Rate", NRF24L01.datarate_e_str_P[self.getDataRate()])
+        self.print_single_status_line("Model", NRF24L01.model_e_str_P[self.isPVariant()])
+        self.print_single_status_line("CRC Length", NRF24L01.crclength_e_str_P[self.getCRCLength()])
+        self.print_single_status_line("PA Power", NRF24L01.pa_dbm_e_str_P[self.getPALevel()])
+
