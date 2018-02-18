@@ -36,20 +36,19 @@ class TestDeviceCreation(unittest.TestCase):
     def test_transmit_mode(self):
         self.radio.enable_dynamic_payload(0)
         self.radio.open_tx_pipe(self.pipes[0], 32)
+
         self.radio.stop_listening()
         self.assertEqual(self.radio.state, 'standby_i', 'State was not STANDBY_I')
 
-    def test_dynammic_rx_payload(self):
-        for k, v in enumerate(self.pipes):
-            self.radio.open_rx_pipe(k, v, 32)
-            self.radio.enable_dynamic_payload(k)
 
-        self.assertTrue(self.radio.is_dynamic_payload(0), 'Dynamic payload not enabled')
-        self.assertTrue(self.radio.is_dynamic_payload(1), 'Dynamic payload not enabled')
-        self.assertTrue(self.radio.is_dynamic_payload(2), 'Dynamic payload not enabled')
-        self.assertTrue(self.radio.is_dynamic_payload(3), 'Dynamic payload not enabled')
-        self.assertTrue(self.radio.is_dynamic_payload(4), 'Dynamic payload not enabled')
-        self.assertTrue(self.radio.is_dynamic_payload(5), 'Dynamic payload not enabled')
+    def test_autoack_mode(self):
+        pass
+
+    def test_dynamic_payload(self):
+        pass
+
+    def test_awk_with_payload(self):
+        pass
 
     def tearDown(self):
         self.radio.stop()
