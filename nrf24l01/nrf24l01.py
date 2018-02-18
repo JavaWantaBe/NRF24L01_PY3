@@ -407,6 +407,56 @@ class NRF24L01(Thread):
         """
         return True if GPIO.input(self.__ce_pin) == GPIO.HIGH else False
 
+    def _write_payload(self, buf):
+        """Writes data to the payload register, automatically padding it
+        to match the required length. Returns the number of bytes
+        actually written.
+
+        :param bytes buf:
+        :return:
+        """
+        if self.is_dynamic_payload(0):
+            if len(buf) > self.MAX_PAYLOAD_SIZE:
+                raise RuntimeError("Dynamic payload is larger than the " + "maximum size.")
+        else:
+            payload_size = self.get_payload_size(0)
+
+            if len(buf) > payload_size:
+                raise RuntimeError("Payload is larger than the fixed payload" + "size (%d vs. %d bytes)" % (len(buf), payload_size))
+            buf += ([0x00] * (payload_size - len(buf)))
+
+        self._write_reg(NRF24L01.W_TX_PAYLOAD, buf)
+        return len(buf)
+
+    def _read_payload(self, buf, buf_len=-1):
+        """Reads data from the payload register and sets the
+        DR bit of the STATUS register.
+
+        :param buf:
+        :param int buf_len:
+        :return:
+        """
+
+        if buf_len < 0:
+            buf_len = self.payload_size
+
+        if not self.dynamic_payloads_enabled:
+            data_len = min(self.payload_size, buf_len)
+            blank_len = self.payload_size - data_len
+        else:
+            data_len = self.get_dynamic_payload_size()
+            blank_len = 0
+
+        txbuffer = [NRF24L01.R_RX_PAYLOAD] + [NRF24L01.NOP] * (blank_len + data_len + 1)
+
+        payload = self.__spidev.xfer2(txbuffer)
+        del buf[:]
+        buf += payload[1:data_len + 1]
+
+        self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR)
+
+        return data_len
+
     @property
     def status(self):
         """Returns the Status register
@@ -894,21 +944,17 @@ class NRF24L01(Thread):
         return result
 
     def run(self):
+        """Overridden run method from Thread class. Thread execution.
 
+        :return:
+        """
         if self.__pri_mode_rx:
+            # PRIM_RX mode
             self._write_reg(NRF24L01.CONFIG, self._read_reg(NRF24L01.CONFIG) | (NRF24L01.PWR_UP | NRF24L01.PRIM_RX))
-
-            # Restore the pipe0 address, if exists
-            if self.__pipe0_reading_address:
-                self._write_reg(self.RX_ADDR_P0, self.__pipe0_reading_address)
-
-            # Put in PRIM_RX mode
             self._ce(GPIO.HIGH)
         else:
             # Enable TX
-            self._write_reg(NRF24L01.CONFIG,
-                            (self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP) & ~NRF24L01.PRIM_RX)
-
+            self._write_reg(NRF24L01.CONFIG, (self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP) & ~NRF24L01.PRIM_RX)
             # Enable pipe 0 for auto-ack
             self._write_reg(NRF24L01.EN_RXADDR, self._read_reg(NRF24L01.EN_RXADDR) | 1)
 
@@ -1002,66 +1048,13 @@ class NRF24L01(Thread):
         print_single_status_line("CRC Length", NRF24L01.crclength_e_str_P[self.crc_length])
         print_single_status_line("PA Power", NRF24L01.pa_dbm_e_str_P[self.pa_level])
 
-
-    def write_payload(self, buf):
-        """Writes data to the payload register, automatically padding it
-        to match the required length. Returns the number of bytes
-        actually written.
-
-        :param bytes buf:
-        :return:
-        """
-        buf = self._to_8b_list(buf)
-
-        if self.is_dynamic_payload(0):
-            if len(buf) > self.MAX_PAYLOAD_SIZE:
-                raise RuntimeError("Dynamic payload is larger than the " + "maximum size.")
-        else:
-            payload_size = self.get_payload_size(0)
-
-            if len(buf) > payload_size:
-                raise RuntimeError("Payload is larger than the fixed payload" + "size (%d vs. %d bytes)" % (len(buf), payload_size))
-            buf += ([0x00] * (payload_size - len(buf)))
-
-        self._write_reg(NRF24L01.W_TX_PAYLOAD, buf)
-        return len(buf)
-
-    def read_payload(self, buf, buf_len=-1):
-        """Reads data from the payload register and sets the
-        DR bit of the STATUS register.
-
-        :param buf:
-        :param int buf_len:
-        :return:
-        """
-
-        if buf_len < 0:
-            buf_len = self.payload_size
-
-        if not self.dynamic_payloads_enabled:
-            data_len = min(self.payload_size, buf_len)
-            blank_len = self.payload_size - data_len
-        else:
-            data_len = self.get_dynamic_payload_size()
-            blank_len = 0
-
-        txbuffer = [NRF24L01.R_RX_PAYLOAD] + [NRF24L01.NOP] * (blank_len + data_len + 1)
-
-        payload = self.__spidev.xfer2(txbuffer)
-        del buf[:]
-        buf += payload[1:data_len + 1]
-
-        self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR)
-
-        return data_len
-
     def write(self, buf):
         self.last_error = None
-        length = self.write_payload(buf)
+        length = self._write_payload(buf)
         self._ce(GPIO.HIGH)
 
         sent_at = monotonic()
-        packet_time = ((1 + length + self.crc_length + self.address_length) * 8 + 9)/(self.data_rate_bits * 1000.)
+        packet_time = ((1 + length + self.crc_length + self.address_width) * 8 + 9)/(self.data_rate * 1000.)
 
         if self.auto_ack != 0:
             packet_time *= 2

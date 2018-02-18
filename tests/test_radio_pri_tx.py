@@ -36,22 +36,7 @@ class TestDeviceTransmit(unittest.TestCase):
         self.radio.start()
         time.sleep(1)
         self.assertEqual(self.radio.state, 'standby_i', 'State was not STANDBY_I mode')
-
-    # def test_transmit_mode(self):
-    #     self.radio.enable_dynamic_payload(0)
-    #     self.radio.open_tx_pipe(self.pipes[0], 32)
-    #
-    #     self.radio.stop_listening()
-    #     self.assertEqual(self.radio.state, 'standby_i', 'State was not STANDBY_I')
-
-    # def test_autoack_mode(self):
-    #     pass
-    #
-    # def test_dynamic_payload(self):
-    #     pass
-    #
-    # def test_awk_with_payload(self):
-    #     pass
+        self.radio.write(b'happy')
 
     def tearDown(self):
         self.radio.stop()
