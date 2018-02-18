@@ -16,6 +16,7 @@ except ImportError:
     from time import time as monotonic
 
 import time
+import math
 from threading import Thread, Lock, Event
 from queue import Queue
 
@@ -335,16 +336,32 @@ class NRF24L01(Thread):
         return data
 
     def _is_prim_rx(self):
+        """Returns status of PRIM_RX. If primary RX mode returns True
+
+        :return:
+        """
         return True if self._read_reg(NRF24L01.CONFIG) & 0x01 else False
 
     def _is_tx_fifo_empty(self):
+        """Returns True if the fifo is empty
+
+        :return:
+        """
         return True if self._read_reg(NRF24L01.FIFO_STATUS) & 0x10 else False
 
     def _is_ce(self):
+        """Returns True if CE is HIGH
+
+        :return:
+        """
         return True if GPIO.input(self.__ce_pin) == GPIO.HIGH else False
 
     @property
     def status(self):
+        """Returns the Status register
+
+        :return byte: status
+        """
         return self._read_reg(NRF24L01.NOP, 1)
 
     # Config registers
@@ -467,7 +484,6 @@ class NRF24L01(Thread):
         """
         # Enable TX
         self._write_reg(NRF24L01.CONFIG, (self._read_reg(NRF24L01.CONFIG) | NRF24L01.PWR_UP) & ~NRF24L01.PRIM_RX)
-        self._ce(GPIO.HIGH)
 
         # Enable pipe 0 for auto-ack
         self._write_reg(NRF24L01.EN_RXADDR, self._read_reg(NRF24L01.EN_RXADDR) | 1)
@@ -517,7 +533,7 @@ class NRF24L01(Thread):
         if not self.is_dynamic_payload(pipe):
             self._write_reg(NRF24L01.RX_PW_P0 + pipe, payload)
 
-    def close_reading_pipe(self, pipe):
+    def close_rx_pipe(self, pipe):
         """Closes RX Pipe
 
         :param int pipe:
@@ -525,9 +541,8 @@ class NRF24L01(Thread):
         """
         self._write_reg(NRF24L01.EN_RXADDR, self._read_reg(NRF24L01.EN_RXADDR) & ~(1 << pipe))
 
-    def open_writing_pipe(self, value, payload):
-        # Note that the NRF24L01L01(+)
-        # expects it LSB first.
+    def open_tx_pipe(self, value, payload):
+        # Note that the NRF24L01L01(+) expects it LSB first.
 
         self._write_reg(NRF24L01.RX_ADDR_P0, value)
         self._write_reg(NRF24L01.TX_ADDR, value)
@@ -558,14 +573,27 @@ class NRF24L01(Thread):
 
         :return int: 0 - 15
         """
-        return self._read_reg(NRF24L01.SETUP_RETR) & 0x07
+        return self._read_reg(NRF24L01.SETUP_RETR) & 0x0F
 
     @retries.setter
-    def retries(self, delay, count):
-        self._write_reg(NRF24L01.SETUP_RETR, (delay & 0xf) << NRF24L01.ARD | (count & 0xf) << NRF24L01.ARC)
-        delay *= 0.000250
-        max_timeout = (self.payload_size / float(self.data_rate_bits) + self.delay) * self.retries
-        self.timeout = (self.payload_size / float(self.data_rate_bits) + self.delay)
+    def retries(self, count):
+        count &= 0x0F
+        self._write_reg(NRF24L01.SETUP_RETR, (self._read_reg(NRF24L01.SETUP_RETR) & ~0x0F) | count)
+
+    @property
+    def delay(self):
+        return (self._read_reg(NRF24L01.SETUP_RETR) & 0xF0) >> NRF24L01.ARD
+
+    @delay.setter
+    def delay(self, delay_time):
+        times = [250 * x for x in range(1, 17)]
+        delay_time = math.ceil(delay_time / 250.0) * 250.0
+
+        if 0 < delay_time <= 4000:
+            if self.data_rate == NRF24L01.BR_250KBPS and delay_time < 500:
+                delay_time = 500
+            value = times.index(int(delay_time))
+            self._write_reg(NRF24L01.SETUP_RETR, (self._read_reg(NRF24L01.SETUP_RETR) & ~0xF0) | (value << NRF24L01.ARD))
 
     @property
     def channel(self):
@@ -694,18 +722,21 @@ class NRF24L01(Thread):
         """
         return self._read_reg(NRF24L01.RPD) & 0x01
 
-    @property
-    def payload_size(self):
-        # TODO Get from pipe
-        return self.__payload_size
+    def get_payload_size(self, pipe):
+        """Gets the RX defined payload size
 
-    @payload_size.setter
-    def payload_size(self, size):
-        self.__payload_size = min(max(size, 1), NRF24L01.MAX_PAYLOAD_SIZE)
+        :param int pipe:
+        :return byte:
+        """
+        return self._read_reg(NRF24L01.RX_PW_P0 + pipe, 1)
 
     def enable_dynamic_payload(self, pipe):
-        if 5 > pipe > 0:
-            raise ValueError('Pipe is from 0 to 5')
+        """Enables dynamic payload
+
+        :param pipe:
+        :return:
+        """
+        assert (6 > pipe >= 0), 'Pipe is from 0 to 5 not {}'.format(pipe)
         # Enable dynamic payload throughout the system
         self._write_reg(NRF24L01.FEATURE, self._read_reg(NRF24L01.FEATURE) | NRF24L01.EN_DPL)
 
@@ -718,11 +749,19 @@ class NRF24L01(Thread):
         self._write_reg(NRF24L01.DYNPD, self._read_reg(NRF24L01.DYNPD) | (1 << pipe))
 
     def is_dynamic_payload(self, pipe):
-        if 5 < pipe < 0:
-            raise ValueError('Pipe is from 0 to 5')
+        """Validates if dynamic payloads are enabled
+
+        :param int pipe:
+        :return bool:
+        """
+        assert (6 > pipe >= 0), 'Pipe is from 0 to 5 not {}'.format(pipe)
         return True if self._read_reg(NRF24L01.DYNPD) & (1 << pipe) else False
 
     def enable_ack_payload(self):
+        """Enable auto Acknowledgement
+
+        :return:
+        """
         # enable ack payload and dynamic payload features
         self._write_reg(NRF24L01.FEATURE, self._read_reg(NRF24L01.FEATURE) | NRF24L01.EN_ACK_PAY | NRF24L01.EN_DPL)
 
@@ -740,25 +779,23 @@ class NRF24L01(Thread):
         to match the required length. Returns the number of bytes
         actually written.
 
-        :param buf:
+        :param bytes buf:
         :return:
         """
-
         buf = self._to_8b_list(buf)
-        if self.dynamic_payloads_enabled:
-            if len(buf) > self.MAX_PAYLOAD_SIZE:
-                raise RuntimeError("Dynamic payload is larger than the " +
-                                   "maximum size.")
-            blank_len = 0
-        else:
-            if len(buf) > self.payload_size:
-                raise RuntimeError("Payload is larger than the fixed payload" +
-                                   "size (%d vs. %d bytes)" % (len(buf), self.payload_size))
-            blank_len = self.payload_size - len(buf)
 
-        txbuffer = [NRF24L01.W_TX_PAYLOAD] + buf + ([0x00] * blank_len)
-        self.__spidev.xfer2(txbuffer)
-        return len(txbuffer) - 1
+        if self.is_dynamic_payload(0):
+            if len(buf) > self.MAX_PAYLOAD_SIZE:
+                raise RuntimeError("Dynamic payload is larger than the " + "maximum size.")
+        else:
+            payload_size = self.get_payload_size(0)
+
+            if len(buf) > payload_size:
+                raise RuntimeError("Payload is larger than the fixed payload" + "size (%d vs. %d bytes)" % (len(buf), payload_size))
+            buf += ([0x00] * (payload_size - len(buf)))
+
+        self._write_reg(NRF24L01.W_TX_PAYLOAD, buf)
+        return len(buf)
 
     def read_payload(self, buf, buf_len=-1):
         """Reads data from the payload register and sets the
@@ -828,8 +865,7 @@ class NRF24L01(Thread):
         return False
 
     def start_fast_write(self, buf):
-        """
-            Do not wait for CE HIGH->LOW
+        """Do not wait for CE HIGH->LOW
         """
         # Send the payload
         self.write_payload(buf)
@@ -892,12 +928,6 @@ class NRF24L01(Thread):
         result = self.ack_payload_available
         self.ack_payload_available = False
         return result
-
-    def getMaxTimeout(self):
-        return self.max_timeout
-
-    def getTimeout(self):
-        return self.timeout
 
     def reset(self):
         """ Make sure the NRF is in the same state as after power up
@@ -990,6 +1020,7 @@ class NRF24L01(Thread):
         self.print_byte_register("OBSERVE_TX", NRF24L01.OBSERVE_TX)
         self.print_byte_register("CONFIG", NRF24L01.CONFIG)
         self.print_byte_register("FIFO_STATUS", NRF24L01.FIFO_STATUS)
+        self.print_byte_register("SETUP RETR", NRF24L01.SETUP_RETR)
         self.print_byte_register("DYNPD", NRF24L01.DYNPD)
         self.print_byte_register("FEATURE", NRF24L01.FEATURE)
         self.print_single_status_line("Data Rate", NRF24L01.datarate_e_str_P[self.data_rate])
