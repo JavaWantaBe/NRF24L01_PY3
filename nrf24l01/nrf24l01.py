@@ -21,8 +21,6 @@ from threading import Thread, Lock, Event
 from queue import Queue
 
 logging.basicConfig(level=logging.DEBUG)
-log = logging.getLogger('NRF24L01')
-log.setLevel(logging.DEBUG)
 
 
 class NRF24L01(Thread):
@@ -200,13 +198,21 @@ class NRF24L01(Thread):
                                transitions=self.transitions,
                                initial='power_down')
 
+        self.log = logging.getLogger('NRF24L01')
+        self.log.setLevel(logging.DEBUG)
+
         # Locks and Queues
         self.__rx_queue = Queue()
         self.__tx_queue = Queue()
         self.__radio_lock = Lock()
+
+        # Events
+        self.__rx_event = Event()
+        self.__tx_event = Event()
+        self.__tx_error_event = Event()
+
         self.__running = False
         self.__pri_mode_rx = pri_mode_rx
-
         self.__rx_event_cb = incoming_data_cb if incoming_data_cb is not None else self._default_callback
 
         # Hardware setup
@@ -218,16 +224,14 @@ class NRF24L01(Thread):
         GPIO.setwarnings(True)
         GPIO.setup(self.__ce_pin, GPIO.OUT, initial=GPIO.LOW)
         self.__irq_pin = irq_pin
-        self.__irq_event = None
 
         # Interrupt driven events
         if self.__irq_pin is not None:
-            self.__irq_event = Event()
             try:
                 GPIO.setup(self.__irq_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
                 GPIO.add_event_detect(self.__irq_pin, GPIO.FALLING, callback=self._handle_irq)
             except RuntimeError:
-                log.debug('Unable to create interrupt mode')
+                self.log.debug('Unable to create interrupt mode')
                 GPIO.cleanup(self.__irq_pin)
                 self.__irq_pin = None
         try:
@@ -274,26 +278,33 @@ class NRF24L01(Thread):
         # Flush buffers
         self._flush_rx()
         self._flush_tx()
-        self._clear_irq_flags()
         self.power_up()
 
-    def _default_callback(self, incoming):
-        pass
+    def _default_callback(self, address, packet_data):
+        self.log.debug('Address {}\r\n{}'.format(address, packet_data))
 
     def _handle_irq(self, gpio):
+        """Handles the interrupt
+
+        :param gpio:
+        :return:
+        """
         if gpio != self.__irq_pin:
             return
 
-        status = self._read_reg(NRF24L01.STATUS) & (NRF24L01.RX_DR | NRF24L01.TX_DS | NRF24L01.MAX_RT )
-        self._clear_irq_flags()
+        status = self._read_reg(NRF24L01.STATUS)
 
         if status & NRF24L01.RX_DR:
-            pass
+            self.__rx_event.set()
+            status |= NRF24L01.RX_DR
         if status & NRF24L01.TX_DS:
-            pass
+            self.__tx_event.set()
+            status |= NRF24L01.TX_DS
         if status & NRF24L01.MAX_RT:
-            pass
+            self.__tx_error_event.set()
+            status |= NRF24L01.MAX_RT
 
+        self._write_reg(NRF24L01.STATUS, status)
 
     def _read_reg(self, reg, length=1):
         """Read LL Register Value
@@ -341,11 +352,10 @@ class NRF24L01(Thread):
         """CE pin used for transmission of packets or continual transmission mode
 
         :param int level: GPIO.HIGH or GPIO.LOW
-        :param pulse:
+        :param float pulse:
         :return:
         """
         GPIO.output(self.__ce_pin, level)
-        # Trigger state machine
         self.ce_high() if level == GPIO.HIGH else self.ce_low()
 
         if pulse > 0:
@@ -369,22 +379,35 @@ class NRF24L01(Thread):
         self._write_reg(NRF24L01.FLUSH_TX, 0)
 
     def _rx_settle_time(self):
+        """Settling time after standby to rx_mode
+
+        :return:
+        """
         time.sleep(130e-9)
         self.rx_settled()
 
     def _tx_settle_time(self):
+        """Settling time after standby to tx_mode
+
+        :return:
+        """
         time.sleep(130e-9)
         self.tx_settled()
 
     def _startup_delay(self):
+        """Startup delay after power up
+
+        :return:
+        """
         time.sleep(150e-6)
         self.start_settled()
 
     def _toggle_features(self):
-        self._write_reg(NRF24L01.ACTIVATE, 0x73)
+        """Toggles the special features
 
-    def _clear_irq_flags(self):
-        self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR | NRF24L01.TX_DS | NRF24L01.MAX_RT)
+        :return:
+        """
+        self._write_reg(NRF24L01.ACTIVATE, 0x73)
 
     def _is_prim_rx(self):
         """Returns status of PRIM_RX. If primary RX mode returns True
@@ -419,43 +442,35 @@ class NRF24L01(Thread):
             if len(buf) > self.MAX_PAYLOAD_SIZE:
                 raise RuntimeError("Dynamic payload is larger than the " + "maximum size.")
         else:
-            payload_size = self.get_payload_size(0)
+            payload_size = self.payload_size(0)
 
             if len(buf) > payload_size:
                 raise RuntimeError("Payload is larger than the fixed payload" + "size (%d vs. %d bytes)" % (len(buf), payload_size))
             buf += ([0x00] * (payload_size - len(buf)))
 
         self._write_reg(NRF24L01.W_TX_PAYLOAD, buf)
+        self._ce(GPIO.HIGH, 10e-6)
         return len(buf)
 
-    def _read_payload(self, buf, buf_len=-1):
+    def _read_payload(self):
         """Reads data from the payload register and sets the
         DR bit of the STATUS register.
 
-        :param buf:
-        :param int buf_len:
-        :return:
+        :return int: payload size
         """
+        pipe = (self._read_reg(NRF24L01.STATUS) & NRF24L01.RX_P_NO_MASK) >> NRF24L01.RX_P_NO
+        p_size = self._read_reg(NRF24L01.R_RX_PL_WID) if self.is_dynamic_payload(pipe) else self.payload_size(pipe)
+        payload = self._read_reg(NRF24L01.R_RX_PAYLOAD, p_size)
+        address_width = self.address_width
 
-        if buf_len < 0:
-            buf_len = self.payload_size
-
-        if not self.dynamic_payloads_enabled:
-            data_len = min(self.payload_size, buf_len)
-            blank_len = self.payload_size - data_len
+        if pipe <= 1:
+            address = self._read_reg((NRF24L01.RX_ADDR_P0 + pipe), address_width)
         else:
-            data_len = self.get_dynamic_payload_size()
-            blank_len = 0
+            address = self._read_reg(NRF24L01.RX_ADDR_P1, address_width)
+            address[address_width - 1] = self._read_reg((NRF24L01.RX_ADDR_P0 + pipe), 1)
 
-        txbuffer = [NRF24L01.R_RX_PAYLOAD] + [NRF24L01.NOP] * (blank_len + data_len + 1)
-
-        payload = self.__spidev.xfer2(txbuffer)
-        del buf[:]
-        buf += payload[1:data_len + 1]
-
-        self._write_reg(NRF24L01.STATUS, NRF24L01.RX_DR)
-
-        return data_len
+        self.__rx_event_cb(address, payload)
+        return p_size
 
     @property
     def status(self):
@@ -463,7 +478,7 @@ class NRF24L01(Thread):
 
         :return byte: status
         """
-        return self._read_reg(NRF24L01.NOP, 1)
+        return self._read_reg(NRF24L01.NOP, 0)
 
     # Config registers
     def enable_interrupt(self, interrupt):
@@ -825,7 +840,7 @@ class NRF24L01(Thread):
         """
         return self._read_reg(NRF24L01.RPD) & 0x01
 
-    def get_payload_size(self, pipe):
+    def payload_size(self, pipe):
         """Gets the RX defined payload size
 
         :param int pipe:
@@ -877,25 +892,6 @@ class NRF24L01(Thread):
         # Enable dynamic payload on pipes 0 & 1
         self._write_reg(NRF24L01.DYNPD, self._read_reg(NRF24L01.DYNPD) | NRF24L01.DPL_P1 | NRF24L01.DPL_P0)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def get_dynamic_payload_size(self):
-        return self.__spidev.xfer2([NRF24L01.R_RX_PL_WID, NRF24L01.NOP])[1]
-
     def available(self, pipe_num=None, irq_wait=False, irq_timeout=30000):
         status = self.status
         result = False
@@ -922,26 +918,20 @@ class NRF24L01(Thread):
 
         return result
 
-    def read(self, buf, buf_len=-1):
-        # Fetch the payload
-        self.read_payload(buf, buf_len)
-
-        # was this the last of the data available?
-        return self._read_reg(NRF24L01.FIFO_STATUS & NRF24L01.RX_EMPTY)
-
-    def write_ack_payload(self, pipe, buf, buf_len):
-        txbuffer = [NRF24L01.W_ACK_PAYLOAD | (pipe & 0x7)]
-
-        max_payload_size = 32
-        data_len = min(buf_len, max_payload_size)
-        txbuffer.extend(buf[0:data_len])
-
-        self.__spidev.xfer2(txbuffer)
+    def write_ack_payload(self, pipe, buf):
+        data_len = min(len(buf), NRF24L01.MAX_PAYLOAD_SIZE)
+        buf = buf[:data_len]
+        self._write_reg((NRF24L01.W_ACK_PAYLOAD | (pipe & 0x7)), buf)
 
     def is_ack_payload_available(self):
         result = self.ack_payload_available
         self.ack_payload_available = False
         return result
+
+    def write_data(self, data, address=None, payload=None):
+        if address is not None and payload is not None:
+            self.open_tx_pipe(address=address, payload=payload)
+        self._write_payload(data)
 
     def run(self):
         """Overridden run method from Thread class. Thread execution.
@@ -975,18 +965,6 @@ class NRF24L01(Thread):
     def stop(self):
         self.__running = False
 
-
-
-
-
-
-
-
-
-
-
-
-
     def process_tx(self):
         while not self._is_tx_fifo_empty():
             # TODO Transmit
@@ -994,6 +972,45 @@ class NRF24L01(Thread):
 
     def process_rx(self):
         pass
+
+    def write(self, buf):
+        self.last_error = None
+        length = self._write_payload(buf)
+        self._ce(GPIO.HIGH)
+
+        sent_at = monotonic()
+        packet_time = ((1 + length + self.crc_length + self.address_width) * 8 + 9)/(self.data_rate * 1000.)
+
+        if self.auto_ack != 0:
+            packet_time *= 2
+
+        if self.retries != 0 and self.auto_ack != 0:
+            timeout = sent_at + (packet_time + self.delay)*self.retries
+        else:
+            timeout = sent_at + packet_time * 2  # 2 is empiric
+
+        #while NRF24L01.TX_DS &  self.get_status() == 0:
+        #    pass
+
+        #print monotonic() - sent_at
+        #print packet_time
+
+        while monotonic() < timeout:
+            time.sleep(packet_time)
+            status = self.status
+            if status & NRF24L01.TX_DS:
+                self._ce(GPIO.LOW)
+                return True
+
+            if status & NRF24L01.MAX_RT:
+                self.last_error = 'MAX_RT'
+                self._ce(GPIO.LOW)
+                break
+
+        self._ce(GPIO.LOW)
+        self._flush_tx()  # Avoid leaving the payload in tx fifo ! What
+        return False
+
 
     def print_details(self):
         def print_status(status):
@@ -1047,56 +1064,3 @@ class NRF24L01(Thread):
         print_single_status_line("Data Rate", NRF24L01.datarate_e_str_P[self.data_rate])
         print_single_status_line("CRC Length", NRF24L01.crclength_e_str_P[self.crc_length])
         print_single_status_line("PA Power", NRF24L01.pa_dbm_e_str_P[self.pa_level])
-
-    def write(self, buf):
-        self.last_error = None
-        length = self._write_payload(buf)
-        self._ce(GPIO.HIGH)
-
-        sent_at = monotonic()
-        packet_time = ((1 + length + self.crc_length + self.address_width) * 8 + 9)/(self.data_rate * 1000.)
-
-        if self.auto_ack != 0:
-            packet_time *= 2
-
-        if self.retries != 0 and self.auto_ack != 0:
-            timeout = sent_at + (packet_time + self.delay)*self.retries
-        else:
-            timeout = sent_at + packet_time * 2  # 2 is empiric
-
-        #while NRF24L01.TX_DS &  self.get_status() == 0:
-        #    pass
-
-        #print monotonic() - sent_at
-        #print packet_time
-
-        while monotonic() < timeout:
-            time.sleep(packet_time)
-            status = self.status
-            if status & NRF24L01.TX_DS:
-                self._ce(GPIO.LOW)
-                return True
-
-            if status & NRF24L01.MAX_RT:
-                self.last_error = 'MAX_RT'
-                self._ce(GPIO.LOW)
-                break
-
-        self._ce(GPIO.LOW)
-        self._flush_tx()  # Avoid leaving the payload in tx fifo ! What
-        return False
-
-    def start_fast_write(self, buf):
-        """Do not wait for CE HIGH->LOW
-        """
-        # Send the payload
-        self.write_payload(buf)
-
-        self._ce(GPIO.HIGH)
-
-    def start_write(self, buf):
-        # Send the payload
-        self.write_payload(buf)
-
-        # Allons!
-        self._ce(1, 10e-6)
